@@ -1,0 +1,138 @@
+name: Deploy Infrastructure
+
+on:
+  pull_request:
+    paths:
+      - 'bicep/**'
+
+  push:
+    branches: [main]
+    paths:
+      - 'bicep/**'
+
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC federated login
+  contents: read
+
+env:
+  # Repository-level secrets (Settings > Secrets and variables > Actions)
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  RESOURCE_GROUP: rg-ctq-redis-cus-001
+  LOCATION: centralus
+
+jobs:
+  # Pull requests: run what-if, ask the Foundry agent to review it, and post
+  # suggested changes. Advisory only: it never changes code or deploys.
+  review:
+    # Runs only when ENABLE_PIPELINE is 'true'. Fork PRs get no OIDC token,
+    # so only run for branches in this repo.
+    if: >-
+      vars.ENABLE_PIPELINE == 'true' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # Use the review identity (the one with the :pull_request credential).
+      # If you only have one identity, set AZURE_CLIENT_ID_REVIEW to its client ID.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_REVIEW }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run what-if (JSON)
+        run: |
+          az deployment group what-if \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file bicep/main.bicep \
+            --no-pretty-print \
+            --only-show-errors > whatif.json
+
+      - name: Diff of changed Bicep files
+        run: git diff "origin/${{ github.base_ref }}...HEAD" -- bicep > diff.txt
+
+      - name: Install review script dependencies
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet azure-ai-projects azure-identity
+
+      - name: Review with Foundry agent
+        env:
+          FOUNDRY_PROJECT_ENDPOINT: ${{ vars.FOUNDRY_PROJECT_ENDPOINT }}
+          FOUNDRY_AGENT_NAME: ${{ vars.FOUNDRY_AGENT_NAME }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          . .venv/bin/activate
+          python scripts/review_whatif.py \
+            --whatif whatif.json \
+            --diff diff.txt \
+            --post
+
+  what-if:
+    if: vars.ENABLE_PIPELINE == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group exists
+        run: |
+          az group create \
+            --name "$RESOURCE_GROUP" \
+            --location "$LOCATION" \
+            --output none
+
+      - name: What-If
+        uses: azure/bicep-deploy@v2
+        with:
+          type: deployment
+          operation: whatIf
+          name: redis-${{ github.run_id }}
+          scope: resourceGroup
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ env.RESOURCE_GROUP }}
+          template-file: bicep/main.bicep
+
+  deploy:
+    if: vars.ENABLE_PIPELINE == 'true' && github.event_name != 'pull_request'
+    needs: what-if
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        uses: azure/bicep-deploy@v2
+        with:
+          type: deployment
+          operation: create
+          name: redis-${{ github.run_id }}
+          scope: resourceGroup
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ env.RESOURCE_GROUP }}
+          template-file: bicep/main.bicep
